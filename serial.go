@@ -16,25 +16,46 @@ type Port interface {
 	// SetMode sets all parameters of the serial port
 	SetMode(mode *Mode) error
 
-	// Sets interbytes timeout
+	// SetReadTimeout sets the whole packet read timeout.
 	// Values:
-	//   x <= 0: disable interbyte timeout
-	//   x >  0: set iterbyte timeout ot x milliseconds
-	SetInterbyteTimeout(msec int) error
+	//   t < 0: Blocking mode
+	// 			`Read` function wait until requested number of bytes are received (possible forever).
+	//   t = 0: Non-blocking mode
+	// 			`Read` function returns immediately in any case, returning up to the requested number of bytes.
+	//   t > 0: set timeout to `t` milliseconds.
+	// 			`Read` function returns immediately when the requested number of bytes are available,
+	//          otherwise wait until the timeout expires and return all bytes that were received until them.
+	SetReadTimeout(t int) error
 
-	// SetReadTimeout sets whole packet read timeout.
-	// Values:
-	//   x < 0: wait forever / until requested number of bytes are received.
-	//   x = 0: non-blocking mode, return immediately in any case, returning zero or more,
-	//          up to the requested number of bytes.
-	//          NOTE: SetReadTimeout(0) for windows resets interbyte timeout to MAXDWORD
-	//   x > 0: set timeout to x milliseconds returns immediately when the requested number of bytes are available,
-	//          otherwise wait until the timeout expires and return all bytes that were received until then.
-	SetReadTimeout(msec int) error
+	// SetReadTimeoutEx — Sets whole package read timeout similar to general purpose function SetReadTimeout(),
+	// and also sets interbyte timeout.
+	//
+	// Generally interbyte timeout is not needed, but in some special cases this function cat help you.
+	SetReadTimeoutEx(t, i uint32) error
+
+	// SetLegacyReadTimeout — Very special function.
+	//
+	// Based on https://msdn.microsoft.com/ru-ru/library/windows/desktop/aa363190(v=vs.85).aspx:
+	// If there are any bytes in the input buffer, ReadFile returns immediately with the bytes in the buffer.
+	// If there are no bytes in the input buffer, ReadFile waits until a byte arrives and then returns immediately.
+	// If no bytes arrive within the time specified by ReadTotalTimeoutConstant, ReadFile times out.
+	//
+	// Use it to configure read timeout in legacy manner. (Legacy for this library).
+	SetLegacyReadTimeout(t uint32) error
 
 	// SetWriteTimeout set whole packet write timeout
-	// For possible values refer to the list for read timeout values above.
-	SetWriteTimeout(msec int) error
+	// Values:
+	// Values:
+	//   t < 0: Blocking mode
+	// 			`Write` function will block until complete or error.
+	// 			Depending of OS layer it can call multiple subsequent os-level write calls until done.
+	//   t = 0: Non-blocking mode
+	// 			`Write` function will write some data and returns even not all data has been written.
+	//          Depending of OS layer it makes only signle subsequent os-level write call.
+	//   t > 0: set timeout to `t` milliseconds.
+	// 			`Write` function will write untile complete, error or timeout.
+	// 			Depending of OS layer it can call multiple subsequent os-levek write calls until done.
+	SetWriteTimeout(t int) error
 
 	// Stores data received from the serial port into the provided byte array
 	// buffer. The function returns the number of bytes read.
@@ -158,10 +179,10 @@ const (
 	FunctionNotImplemented
 	// Operating system function error
 	OsError
-	// Port operation timed out
-	Timeout
 	// Port write failed
 	WriteFailed
+	// Port read failed
+	ReadFailed
 )
 
 // EncodedErrorString returns a string explaining the error code
@@ -193,8 +214,6 @@ func (e PortError) EncodedErrorString() string {
 		return "Function not implemented"
 	case OsError:
 		return "Operating system error"
-	case Timeout:
-		return "Timeout"
 	case WriteFailed:
 		return "Write failed"
 	default:

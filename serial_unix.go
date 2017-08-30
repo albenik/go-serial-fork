@@ -25,8 +25,9 @@ type unixPort struct {
 	name   string
 	handle int
 
-	readTimeout  int
-	writeTimeout int
+	legacyTimeout bool
+	readTimeout   int
+	writeTimeout  int
 
 	closeLock   sync.RWMutex
 	closeSignal *unixutils.Pipe
@@ -68,15 +69,14 @@ func (port *unixPort) Read(p []byte) (int, error) {
 		return 0, &PortError{code: PortClosed}
 	}
 
-	rlen := len(p)
-	read := 0
-	deadline := time.Now().Add(time.Duration(port.readTimeout) * time.Millisecond)
+	size, read := len(p), 0
 	fds := unixutils.NewFDSet(port.handle, port.closeSignal.ReadFD())
-	for read < rlen {
-		now := time.Now()
-		if !deadline.After(now) {
-			return 0, nil
-		}
+	buf := make([]byte, size)
+
+	now := time.Now()
+	deadline := now.Add(time.Duration(port.readTimeout) * time.Millisecond)
+
+	for read < size {
 		res, err := unixutils.Select(fds, nil, fds, deadline.Sub(now))
 		if err != nil {
 			return read, err
@@ -85,63 +85,62 @@ func (port *unixPort) Read(p []byte) (int, error) {
 			return read, &PortError{code: PortClosed}
 		}
 		if !res.IsReadable(port.handle) {
-			return 0, nil
+			break
 		}
-		n, err := unix.Read(port.handle, p)
+		n, err := unix.Read(port.handle, buf)
+		// read should always return some data as select reported it was ready to read when we get to this point.
+		if err == nil && n == 0 {
+			err = &PortError{code: ReadFailed}
+		}
 		if err != nil {
 			return read, err
 		}
+		copy(p[read:], buf[:n])
 		read += n
+
+		now = time.Now()
+		if !now.Before(deadline) || port.legacyTimeout {
+			break
+		}
 	}
 	return read, nil
 }
 
 func (port *unixPort) Write(p []byte) (int, error) {
-	wlen := len(p)
-	written := 0
-
-	var deadline time.Time
-	if port.writeTimeout > 0 {
-		deadline = time.Now().Add(time.Duration(port.writeTimeout) * time.Millisecond)
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if !port.opened {
+		return 0, &PortError{code: PortClosed}
 	}
 
+	size, written := len(p), 0
 	fds := unixutils.NewFDSet(port.handle)
 	clFds := unixutils.NewFDSet(port.closeSignal.ReadFD())
 
-	for written < wlen {
-		n, err := unix.Write(port.handle, p)
-		written += n
-		switch {
-		case err != nil:
-			return 0, err
-		case port.writeTimeout == 0:
+	deadline := time.Now().Add(time.Duration(port.writeTimeout) * time.Millisecond)
+
+	for written < size {
+		n, err := unix.Write(port.handle, p[written:])
+		if err != nil {
+			return written, err
+		}
+		if port.writeTimeout == 0 {
 			return n, nil
-		case port.writeTimeout > 0:
-			now := time.Now()
-			if !deadline.After(now) {
-				return n, &PortError{code: Timeout}
-			}
-			res, err := unixutils.Select(clFds, fds, fds, deadline.Sub(now))
-			if err != nil {
-				return n, err
-			}
-			if res.IsReadable(port.closeSignal.ReadFD()) {
-				return n, &PortError{code: PortClosed}
-			}
-			if !res.IsWritable(port.handle) {
-				return n, &PortError{code: Timeout}
-			}
-		default:
-			res, err := unixutils.Select(clFds, fds, fds, -1)
-			if err != nil {
-				return n, err
-			}
-			if res.IsReadable(port.closeSignal.ReadFD()) {
-				return n, &PortError{code: PortClosed}
-			}
-			if !res.IsWritable(port.handle) {
-				return n, &PortError{code: WriteFailed}
-			}
+		}
+		written += n
+		now := time.Now()
+		if port.writeTimeout > 0 && !now.Before(deadline) {
+			return written, nil
+		}
+		res, err := unixutils.Select(clFds, fds, fds, deadline.Sub(now))
+		if err != nil {
+			return written, err
+		}
+		if res.IsReadable(port.closeSignal.ReadFD()) {
+			return written, &PortError{code: PortClosed}
+		}
+		if !res.IsWritable(port.handle) {
+			return written, &PortError{code: WriteFailed}
 		}
 	}
 	return written, nil
@@ -202,6 +201,12 @@ func (port *unixPort) SetRTS(rts bool) error {
 }
 
 func (port *unixPort) SetInterbyteTimeout(timeout int) error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if !port.opened {
+		return &PortError{code: PortClosed}
+	}
+
 	settings, err := port.getTermSettings()
 	if err != nil {
 		return err
@@ -213,8 +218,38 @@ func (port *unixPort) SetInterbyteTimeout(timeout int) error {
 }
 
 func (port *unixPort) SetReadTimeout(t int) error {
+	port.legacyTimeout = false
 	port.readTimeout = t
 	return nil // timeout is done via select
+}
+
+func (port *unixPort) SetReadTimeoutEx(t, i uint32) error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if !port.opened {
+		return &PortError{code: PortClosed}
+	}
+
+	port.legacyTimeout = false
+	port.readTimeout = int(t)
+	settings, err := port.getTermSettings()
+	if err != nil {
+		return err
+	}
+	if err := setTermSettingsInterbyteTimeout(int(t), settings); err != nil {
+		return err
+	}
+	return port.setTermSettings(settings)
+}
+
+func (port *unixPort) SetLegacyReadTimeout(t uint32) error {
+	if t > 0 && t < 0xFFFFFFFF {
+		port.legacyTimeout = true
+		port.readTimeout = int(t)
+		return nil
+	} else {
+		return &PortError{code: InvalidTimeoutValue}
+	}
 }
 
 func (port *unixPort) SetWriteTimeout(t int) error {
@@ -250,6 +285,10 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 		name:   portName,
 		handle: h,
 		opened: true,
+
+		legacyTimeout: true,
+		readTimeout:   1000, // Backward compatible default value
+		writeTimeout:  0,
 	}
 
 	// Setup serial port

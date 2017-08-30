@@ -12,6 +12,10 @@ package serial // import "go.bug.st/serial.v1"
 // http://msdn.microsoft.com/en-us/library/ff802693.aspx
 // (alternative link) https://msdn.microsoft.com/en-us/library/ms810467.aspx
 
+// PySerial source code and docs:
+// https://github.com/pyserial/pyserial
+// https://pythonhosted.org/pyserial/
+
 // Arduino Playground article on serial communication with Windows API:
 // http://playground.arduino.cc/Interfacing/CPPWindows
 
@@ -62,18 +66,23 @@ func (port *windowsPort) GetName() string {
 }
 
 func (port *windowsPort) Close() error {
-	return syscall.CloseHandle(port.handle)
+	h := port.handle
+	if h == syscall.InvalidHandle {
+		return nil
+	}
+	port.handle = syscall.InvalidHandle
+	return syscall.CloseHandle(h)
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
 	if port.handle == syscall.InvalidHandle {
 		return 0, &PortError{code: PortClosed, causedBy: nil}
 	}
+	handle := port.handle
 
 	errs := new(uint32)
 	stat := new(comstat)
-	if err := clearCommError(port.handle, errs, stat); err != nil {
-		port.Close()
+	if err := clearCommError(handle, errs, stat); err != nil {
 		return 0, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 
@@ -89,18 +98,18 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 		readSize = size
 	}
 
-	var read uint32
 	if readSize > 0 {
-		overlappedEv, err := createOverlappedEvent()
+		var read uint32
+		overlapped, err := createOverlappedStruct()
 		if err != nil {
 			return 0, &PortError{code: OsError, causedBy: err}
 		}
-		defer syscall.CloseHandle(overlappedEv.HEvent)
-		err = syscall.ReadFile(port.handle, p, &read, overlappedEv)
+		defer syscall.CloseHandle(overlapped.HEvent)
+		err = syscall.ReadFile(handle, p[:readSize], &read, overlapped)
 		if err != nil && err != syscall.ERROR_IO_PENDING {
 			return 0, &PortError{code: OsError, causedBy: err}
 		}
-		err = getOverlappedResult(port.handle, overlappedEv, &read, true)
+		err = getOverlappedResult(handle, overlapped, &read, true)
 		if err != nil && err != syscall.ERROR_OPERATION_ABORTED {
 			return 0, &PortError{code: OsError, causedBy: err}
 		}
@@ -111,15 +120,26 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 }
 
 func (port *windowsPort) Write(p []byte) (int, error) {
-	ev, err := createOverlappedEvent()
+	if port.handle == syscall.InvalidHandle {
+		return 0, &PortError{code: PortClosed, causedBy: nil}
+	}
+	handle := port.handle
+
+	errs := new(uint32)
+	stat := new(comstat)
+	if err := clearCommError(handle, errs, stat); err != nil {
+		return 0, &PortError{code: InvalidSerialPort, causedBy: err}
+	}
+
+	overlapped, err := createOverlappedStruct()
 	if err != nil {
 		return 0, err
 	}
-	defer syscall.CloseHandle(ev.HEvent)
+	defer syscall.CloseHandle(overlapped.HEvent)
 	var written uint32
-	err = syscall.WriteFile(port.handle, p, &written, ev)
+	err = syscall.WriteFile(handle, p, &written, overlapped)
 	if err == nil || err == syscall.ERROR_IO_PENDING || err == syscall.ERROR_OPERATION_ABORTED {
-		err = getOverlappedResult(port.handle, ev, &written, true)
+		err = getOverlappedResult(handle, overlapped, &written, true)
 		if err == nil || err == syscall.ERROR_OPERATION_ABORTED {
 			return int(written), nil
 		}
@@ -229,7 +249,7 @@ func (port *windowsPort) GetModemStatusBits() (*ModemStatusBits, error) {
 	}, nil
 }
 
-func createOverlappedEvent() (*syscall.Overlapped, error) {
+func createOverlappedStruct() (*syscall.Overlapped, error) {
 	if h, err := createEvent(nil, true, false, nil); err == nil {
 		return &syscall.Overlapped{HEvent: h}, nil
 	} else {
@@ -245,9 +265,10 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	handle, err := syscall.CreateFile(
 		path,
 		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		0, nil,
+		0,   // exclusive access
+		nil, // no security
 		syscall.OPEN_EXISTING,
-		syscall.FILE_FLAG_OVERLAPPED,
+		syscall.FILE_ATTRIBUTE_NORMAL|syscall.FILE_FLAG_OVERLAPPED,
 		0)
 	if err != nil {
 		switch err {
@@ -274,9 +295,9 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	}
 
 	if err = port.reconfigurePort(); err != nil {
+		port.Close()
 		return nil, err
 	}
-
 	return port, nil
 }
 
@@ -347,34 +368,53 @@ func (port *windowsPort) reconfigurePort() error {
 	return nil
 }
 
-func (port *windowsPort) SetInterbyteTimeout(t int) error {
-	if t > 0 {
-		port.timeouts.ReadIntervalTimeout = uint32(t)
-	} else {
+func (port *windowsPort) SetReadTimeout(t int) error {
+	switch {
+	case t < 0: // Block until the buffer is full.
 		port.timeouts.ReadIntervalTimeout = 0
+		port.timeouts.ReadTotalTimeoutMultiplier = 0
+		port.timeouts.ReadTotalTimeoutConstant = 0
+	case t == 0: // Return immediately with or without data.
+		port.timeouts.ReadIntervalTimeout = 0xFFFFFFFF
+		port.timeouts.ReadTotalTimeoutMultiplier = 0
+		port.timeouts.ReadTotalTimeoutConstant = 0
+	case t > 0: // Block until the buffer is full or timeout occurs.
+		port.timeouts.ReadIntervalTimeout = 0
+		port.timeouts.ReadTotalTimeoutMultiplier = 0
+		port.timeouts.ReadTotalTimeoutConstant = uint32(t)
 	}
 	return port.reconfigurePort()
 }
 
-func (port *windowsPort) SetReadTimeout(t int) error {
-	switch {
-	case t == 0:
-		port.timeouts.ReadIntervalTimeout = 0xFFFFFFFF
-		port.timeouts.ReadTotalTimeoutConstant = 0
-	case t > 0:
-		port.timeouts.ReadTotalTimeoutConstant = uint32(t)
-	default:
-		port.timeouts.ReadIntervalTimeout = 0
-		port.timeouts.ReadTotalTimeoutConstant = 0
-	}
+func (port *windowsPort) SetReadTimeoutEx(t, i uint32) error {
+	port.timeouts.ReadIntervalTimeout = i
+	port.timeouts.ReadTotalTimeoutMultiplier = 0
+	port.timeouts.ReadTotalTimeoutConstant = t
 	return port.reconfigurePort()
+}
+
+func (port *windowsPort) SetLegacyReadTimeout(t uint32) error {
+	if t > 0 && t < 0xFFFFFFFF {
+		port.timeouts.ReadIntervalTimeout = 0xFFFFFFFF
+		port.timeouts.ReadTotalTimeoutMultiplier = 0xFFFFFFFF
+		port.timeouts.ReadTotalTimeoutConstant = t
+		return port.reconfigurePort()
+	} else {
+		return &PortError{code: InvalidTimeoutValue}
+	}
 }
 
 func (port *windowsPort) SetWriteTimeout(t int) error {
-	if t > 0 {
-		port.timeouts.WriteTotalTimeoutConstant = uint32(t)
-	} else {
+	switch {
+	case t < 0:
+		port.timeouts.WriteTotalTimeoutMultiplier = 0
 		port.timeouts.WriteTotalTimeoutConstant = 0
+	case t == 0:
+		port.timeouts.WriteTotalTimeoutMultiplier = 0
+		port.timeouts.WriteTotalTimeoutConstant = 0xFFFFFFFF
+	case t > 0:
+		port.timeouts.WriteTotalTimeoutMultiplier = 0
+		port.timeouts.WriteTotalTimeoutConstant = uint32(t)
 	}
 	return port.reconfigurePort()
 }
