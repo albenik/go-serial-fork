@@ -62,6 +62,19 @@ func (port *unixPort) Close() error {
 	return nil
 }
 
+func (port *unixPort) ReadyToRead() (uint32, error) {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if !port.opened {
+		return 0, &PortError{code: PortClosed}
+	}
+	var n uint32
+	if err := ioctl(port.handle, FIONREAD, uintptr(unsafe.Pointer(&n))); err != nil {
+		return 0, &PortError{code: OsError, causedBy: err}
+	}
+	return n, nil
+}
+
 func (port *unixPort) Read(p []byte) (int, error) {
 	port.closeLock.RLock()
 	defer port.closeLock.RUnlock()

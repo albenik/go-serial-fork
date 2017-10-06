@@ -57,6 +57,9 @@ type Port interface {
 	// 			Depending of OS layer it can call multiple subsequent os-levek write calls until done.
 	SetWriteTimeout(t int) error
 
+	// Get the number of bytes that are immediately available for reading
+	ReadyToRead() (uint32, error)
+
 	// Stores data received from the serial port into the provided byte array
 	// buffer. The function returns the number of bytes read.
 	//

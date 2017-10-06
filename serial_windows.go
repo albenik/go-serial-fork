@@ -74,6 +74,15 @@ func (port *windowsPort) Close() error {
 	return syscall.CloseHandle(h)
 }
 
+func (port *windowsPort) ReadyToRead() (uint32, error) {
+	var errs uint32
+	var stat comstat
+	if err := clearCommError(port.handle, &errs, &stat); err != nil {
+		return 0, &PortError{code: OsError, causedBy: err}
+	}
+	return stat.inque, nil
+}
+
 func (port *windowsPort) Read(p []byte) (int, error) {
 	if port.handle == syscall.InvalidHandle {
 		return 0, &PortError{code: PortClosed, causedBy: nil}
