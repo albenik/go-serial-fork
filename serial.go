@@ -6,12 +6,13 @@
 
 package serial // import "go.bug.st/serial.v1"
 
+import "fmt"
+
 //go:generate go run $GOROOT/src/syscall/mksyscall_windows.go -output zsyscall_windows.go syscall_windows.go
 
 // Port is the interface for a serial Port
 type Port interface {
-	// Get port name used with serial.Open()
-	GetName() string
+	fmt.Stringer
 
 	// SetMode sets all parameters of the serial port
 	SetMode(mode *Mode) error

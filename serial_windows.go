@@ -61,7 +61,7 @@ func nativeGetPortsList() ([]string, error) {
 	return list, nil
 }
 
-func (port *windowsPort) GetName() string {
+func (port *windowsPort) String() string {
 	return port.name
 }
 

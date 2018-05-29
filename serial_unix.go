@@ -34,7 +34,7 @@ type unixPort struct {
 	opened      bool
 }
 
-func (port *unixPort) GetName() string {
+func (port *unixPort) String() string {
 	return port.name
 }
 
